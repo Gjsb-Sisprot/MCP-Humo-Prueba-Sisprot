@@ -1,6 +1,6 @@
 
-import { sql } from '../db/index.js';
-import type { Conversation } from '../db/types.js';
+import { supabase } from '../db/index.js';
+import type { Conversation, ChatLog } from '../db/types.js';
 import { closeConversation } from './handover.js';
 import { emit } from '../lib/event-bus.js';
 
@@ -55,12 +55,11 @@ export function getInactivityStats() {
 }
 
 export async function resetInactivityWarning(conversationId: string): Promise<void> {
-  await sql`
-    UPDATE conversations
-    SET inactivity_warned_at = NULL
-    WHERE id = ${conversationId}
-    AND inactivity_warned_at IS NOT NULL
-  `;
+  await supabase
+    .from('conversations')
+    .update({ inactivity_warned_at: null })
+    .eq('id', conversationId)
+    .not('inactivity_warned_at', 'is', null);
 }
 
 async function processInactiveConversations(): Promise<void> {
@@ -73,97 +72,99 @@ async function processInactiveConversations(): Promise<void> {
 
     stats.runs++;
     lastRunAt = new Date();
-
-    if (warnedCount > 0 || closedCount > 0) {
-    }
   } finally {
     isRunning = false;
   }
 }
 
 async function warnInactiveConversations(): Promise<number> {
-  const conversations = await sql<(Conversation & { last_message_at: string })[]>`
-    SELECT c.*, sub.last_message_at
-    FROM conversations c
-    INNER JOIN LATERAL (
-      SELECT 
-        cl.role AS last_role,
-        cl.created_at AS last_message_at
-      FROM chat_logs cl
-      WHERE cl.conversation_id = c.id
-      ORDER BY cl.created_at DESC
-      LIMIT 1
-    ) sub ON sub.last_role IN ('model', 'assistant', 'system')
-    WHERE c.status = 'active'
-      AND c.inactivity_warned_at IS NULL
-      AND sub.last_message_at < NOW() - make_interval(mins => ${WARN_MINUTES})
-  `;
+  const warnThreshold = new Date(Date.now() - WARN_MINUTES * 60 * 1000).toISOString();
+  
+  // Fetch active conversations that haven't been warned yet
+  const { data: convs, error } = await supabase
+    .from('conversations')
+    .select('*, chat_logs(role, created_at)')
+    .eq('status', 'active')
+    .is('inactivity_warned_at', null);
 
-  for (const conv of conversations) {
-    try {
-      
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (${conv.id}, 'system', ${WARNING_MESSAGE})
-      `;
+  if (error || !convs) return 0;
 
-      await sql`
-        UPDATE conversations
-        SET inactivity_warned_at = NOW(), updated_at = NOW()
-        WHERE id = ${conv.id}
-      `;
+  let count = 0;
+  for (const conv of convs) {
+    // Get last message manually because we don't want to use RPC yet
+    const logs = conv.chat_logs as any[];
+    if (!logs || logs.length === 0) continue;
 
-      stats.warned++;
+    const lastLog = logs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    
+    // Only warn if the last message was from the bot/system and is old
+    if (['model', 'assistant', 'system'].includes(lastLog.role) && lastLog.created_at < warnThreshold) {
+      try {
+        await supabase
+          .from('chat_logs')
+          .insert({ conversation_id: conv.id, role: 'system', content: WARNING_MESSAGE });
 
-      emit({
-        type: 'new_message',
-        sessionId: conv.session_id,
-        data: { role: 'system', content: WARNING_MESSAGE },
-        timestamp: new Date().toISOString(),
-      });
-    } catch (err) {
-      stats.errors++;
+        await supabase
+          .from('conversations')
+          .update({ inactivity_warned_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('id', conv.id);
+
+        stats.warned++;
+        count++;
+
+        emit({
+          type: 'new_message',
+          sessionId: conv.session_id,
+          data: { role: 'system', content: WARNING_MESSAGE },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        stats.errors++;
+      }
     }
   }
 
-  return conversations.length;
+  return count;
 }
 
 async function closeTimedOutConversations(): Promise<number> {
-  const conversations = await sql<Conversation[]>`
-    SELECT c.*
-    FROM conversations c
-    WHERE c.status = 'active'
-      AND c.inactivity_warned_at IS NOT NULL
-      AND c.inactivity_warned_at < NOW() - make_interval(mins => ${CLOSE_MINUTES})
-      AND NOT EXISTS (
-        SELECT 1 FROM chat_logs cl
-        WHERE cl.conversation_id = c.id
-          AND cl.role = 'user'
-          AND cl.created_at > c.inactivity_warned_at
-      )
-  `;
+  const closeThreshold = new Date(Date.now() - CLOSE_MINUTES * 60 * 1000).toISOString();
+  
+  const { data: convs, error } = await supabase
+    .from('conversations')
+    .select('*, chat_logs(role, created_at)')
+    .eq('status', 'active')
+    .not('inactivity_warned_at', 'is', null)
+    .lt('inactivity_warned_at', closeThreshold);
 
-  for (const conv of conversations) {
+  if (error || !convs) return 0;
+
+  let count = 0;
+  for (const conv of convs) {
     try {
+      // Check if user has replied since warning
+      const logs = conv.chat_logs as any[];
+      const userReplied = logs.some(l => l.role === 'user' && l.created_at > conv.inactivity_warned_at);
       
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (${conv.id}, 'system', ${CLOSE_MESSAGE})
-      `;
+      if (!userReplied) {
+        await supabase
+          .from('chat_logs')
+          .insert({ conversation_id: conv.id, role: 'system', content: CLOSE_MESSAGE });
 
-      await closeConversation({
-        sessionId: conv.session_id,
-        resolution: 'Conversación cerrada automáticamente por inactividad del cliente.',
-        closedBy: 'system',
-        createTicket: true,
-      });
+        await closeConversation({
+          sessionId: conv.session_id,
+          resolution: 'Conversación cerrada automáticamente por inactividad del cliente.',
+          closedBy: 'system',
+          createTicket: true,
+        });
 
-      stats.closed++;
+        stats.closed++;
+        count++;
+      }
     } catch (err) {
       stats.errors++;
     }
   }
 
-  return conversations.length;
+  return count;
 }
