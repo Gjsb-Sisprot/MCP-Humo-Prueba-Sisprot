@@ -1,6 +1,6 @@
 
 import { z } from 'zod';
-import { sql } from '../db/index.js';
+import { supabase } from '../db/index.js';
 import type { Conversation, ConversationStatus } from '../db/types.js';
 
 export const listConversationsSchema = z.object({
@@ -52,35 +52,25 @@ export async function listConversations(input: ListConversationsInput): Promise<
 }> {
   const { userId, status, limit, offset, orderBy, order } = listConversationsSchema.parse(input);
   
-  const conditions: string[] = [];
+  let query = supabase
+    .from('conversations')
+    .select('*, chat_logs(count)', { count: 'exact' });
+
   if (userId) {
-    conditions.push(`c.user_id = '${userId}'`);
+    query = query.eq('user_id', userId);
   }
   if (status) {
-    conditions.push(`c.status = '${status}'`);
+    query = query.eq('status', status);
   }
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  
-  const countResult = await sql<{ count: string }[]>`
-    SELECT COUNT(*)::text as count FROM conversations c ${sql.unsafe(whereClause)}
-  `;
-  const total = parseInt(countResult[0]?.count || '0', 10);
-  
-  const orderClause = `ORDER BY c.${orderBy} ${order.toUpperCase()}`;
-  
-  const conversations = await sql<(Conversation & { message_count: string })[]>`
-    SELECT 
-      c.*,
-      (SELECT COUNT(*)::text FROM chat_logs WHERE conversation_id = c.id) as message_count
-    FROM conversations c
-    ${sql.unsafe(whereClause)}
-    ${sql.unsafe(orderClause)}
-    LIMIT ${limit}
-    OFFSET ${offset}
-  `;
+
+  const { data, count, error } = await query
+    .order(orderBy, { ascending: order === 'asc' })
+    .range(offset, offset + limit - 1);
+
+  if (error) throw error;
   
   return {
-    conversations: conversations.map(c => ({
+    conversations: (data || []).map(c => ({
       sessionId: c.session_id,
       userId: c.user_id,
       status: c.status,
@@ -100,53 +90,41 @@ export async function listConversations(input: ListConversationsInput): Promise<
       glpiTicketId: c.glpi_ticket_id,
       createdAt: c.created_at,
       updatedAt: c.updated_at,
-      messageCount: parseInt(c.message_count || '0', 10),
+      messageCount: c.chat_logs?.[0]?.count || 0,
     })),
-    total,
+    total: count || 0,
   };
 }
 
 export async function searchConversations(input: SearchConversationsInput): Promise<ConversationSummary[]> {
   const { userId, identification, contract, sector, limit } = searchConversationsSchema.parse(input);
   
-  const conditions: string[] = [];
-  
+  let query = supabase
+    .from('conversations')
+    .select('*, chat_logs(count)');
+
   if (userId) {
-    conditions.push(`user_id = '${userId}'`);
+    query = query.eq('user_id', userId);
   }
   
-  const searchConditions: string[] = [];
-  if (identification) {
-    searchConditions.push(`identification ILIKE '%${identification}%'`);
-  }
-  if (contract) {
-    searchConditions.push(`contract ILIKE '%${contract}%'`);
-  }
-  if (sector) {
-    searchConditions.push(`sector ILIKE '%${sector}%'`);
-  }
-  
-  if (searchConditions.length > 0) {
-    conditions.push(`(${searchConditions.join(' OR ')})`);
+  if (identification || contract || sector) {
+    let orConditions = [];
+    if (identification) orConditions.push(`identification.ilike.%${identification}%`);
+    if (contract) orConditions.push(`contract.ilike.%${contract}%`);
+    if (sector) orConditions.push(`sector.ilike.%${sector}%`);
+    query = query.or(orConditions.join(','));
+  } else {
+    // If no search terms, return empty if no userId either
+    if (!userId) return [];
   }
   
-  if (conditions.length === 0) {
-    return [];
-  }
+  const { data, error } = await query
+    .order('updated_at', { ascending: false })
+    .limit(limit);
   
-  const whereClause = `WHERE ${conditions.join(' AND ')}`;
+  if (error) throw error;
   
-  const conversations = await sql<(Conversation & { message_count: string })[]>`
-    SELECT 
-      c.*,
-      (SELECT COUNT(*)::text FROM chat_logs WHERE conversation_id = c.id) as message_count
-    FROM conversations c
-    ${sql.unsafe(whereClause)}
-    ORDER BY c.updated_at DESC
-    LIMIT ${limit}
-  `;
-  
-  return conversations.map(c => ({
+  return (data || []).map(c => ({
     sessionId: c.session_id,
     userId: c.user_id,
     status: c.status,
@@ -166,7 +144,7 @@ export async function searchConversations(input: SearchConversationsInput): Prom
     glpiTicketId: c.glpi_ticket_id,
     createdAt: c.created_at,
     updatedAt: c.updated_at,
-    messageCount: parseInt(c.message_count || '0', 10),
+    messageCount: c.chat_logs?.[0]?.count || 0,
   }));
 }
 
@@ -183,26 +161,27 @@ export async function getSpecialistStats(specialistEmail: string): Promise<{
   closedToday: number;
   avgResponseTime: number | null;
 }> {
-  
-  const activeResult = await sql<{ count: string }[]>`
-    SELECT COUNT(*)::text as count 
-    FROM conversations 
-    WHERE specialist_id = ${specialistEmail} 
-    AND status IN ('handed_over', 'active')
-  `;
+  const { count: activeCount, error: activeError } = await supabase
+    .from('conversations')
+    .select('*', { count: 'exact', head: true })
+    .eq('specialist_id', specialistEmail)
+    .in('status', ['handed_over', 'active']);
+
+  if (activeError) throw activeError;
   
   const today = new Date().toISOString().split('T')[0];
-  const closedResult = await sql<{ count: string }[]>`
-    SELECT COUNT(*)::text as count 
-    FROM conversations 
-    WHERE specialist_id = ${specialistEmail} 
-    AND status = 'closed'
-    AND DATE(updated_at) = ${today}
-  `;
+  const { count: closedCount, error: closedError } = await supabase
+    .from('conversations')
+    .select('*', { count: 'exact', head: true })
+    .eq('specialist_id', specialistEmail)
+    .eq('status', 'closed')
+    .gte('updated_at', today);
+  
+  if (closedError) throw closedError;
   
   return {
-    activeConversations: parseInt(activeResult[0]?.count || '0', 10),
-    closedToday: parseInt(closedResult[0]?.count || '0', 10),
+    activeConversations: activeCount || 0,
+    closedToday: closedCount || 0,
     avgResponseTime: null, 
   };
 }
