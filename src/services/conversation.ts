@@ -1,6 +1,6 @@
 
 import { z } from 'zod';
-import { sql } from '../db/index.js';
+import { supabase } from '../db/index.js';
 import type { Conversation, ChatLog, ConversationStatus, MessageRole } from '../db/types.js';
 import { resetInactivityWarning } from './inactivity.js';
 
@@ -46,29 +46,37 @@ export interface ConversationMessage {
 }
 
 export async function getOrCreateConversation(sessionId: string, userId?: string): Promise<Conversation> {
+  const { data: existing, error: findError } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('session_id', sessionId)
+    .maybeSingle();
   
-  const existing = await sql<Conversation[]>`
-    SELECT * FROM conversations 
-    WHERE session_id = ${sessionId}
-    LIMIT 1
-  `;
+  if (findError) throw findError;
   
-  if (existing[0]) {
-    
-    if (userId && !existing[0].user_id) {
-      await sql`UPDATE conversations SET user_id = ${userId} WHERE id = ${existing[0].id}`;
-      existing[0].user_id = userId;
+  if (existing) {
+    if (userId && !existing.user_id) {
+      const { data: updated, error: updateError } = await supabase
+        .from('conversations')
+        .update({ user_id: userId, updated_at: new Date().toISOString() })
+        .eq('id', existing.id)
+        .select()
+        .single();
+      
+      if (updateError) throw updateError;
+      return updated as unknown as Conversation;
     }
-    return existing[0];
+    return existing as unknown as Conversation;
   }
   
-  const created = await sql<Conversation[]>`
-    INSERT INTO conversations (session_id, user_id, status)
-    VALUES (${sessionId}, ${userId || null}, 'active')
-    RETURNING *
-  `;
+  const { data: created, error: insertError } = await supabase
+    .from('conversations')
+    .insert({ session_id: sessionId, user_id: userId || null, status: 'active' })
+    .select()
+    .single();
   
-  return created[0];
+  if (insertError) throw insertError;
+  return created as unknown as Conversation;
 }
 
 export async function saveInteraction(input: SaveInteractionInput): Promise<ChatLog> {
@@ -89,36 +97,40 @@ export async function saveInteraction(input: SaveInteractionInput): Promise<Chat
   
   const conversation = await getOrCreateConversation(sessionId, userId);
   
-  const result = await sql<ChatLog[]>`
-    INSERT INTO chat_logs (conversation_id, role, content, tool_name, tool_call_id)
-    VALUES (
-      ${conversation.id}, 
-      ${role}, 
-      ${content}, 
-      ${toolName || null},
-      ${toolCallId || null}
-    )
-    RETURNING *
-  `;
+  const { data: log, error: logError } = await supabase
+    .from('chat_logs')
+    .insert({
+      conversation_id: conversation.id, 
+      role, 
+      content, 
+      tool_name: toolName || null,
+      tool_call_id: toolCallId || null
+    })
+    .select()
+    .single();
   
-  await sql`
-    UPDATE conversations 
-    SET 
-      identification = COALESCE(${identification ?? null}, identification),
-      contract = COALESCE(${contract ?? null}, contract),
-      sector = COALESCE(${sector ?? null}, sector),
-      contact_name = COALESCE(${contactName ?? null}, contact_name),
-      contact_email = COALESCE(${contactEmail ?? null}, contact_email),
-      contact_phone = COALESCE(${contactPhone ?? null}, contact_phone),
-      updated_at = NOW() 
-    WHERE id = ${conversation.id}
-  `;
+  if (logError) throw logError;
+  
+  const updates: Record<string, any> = { updated_at: new Date().toISOString() };
+  if (identification !== undefined) updates.identification = identification;
+  if (contract !== undefined) updates.contract = contract;
+  if (sector !== undefined) updates.sector = sector;
+  if (contactName !== undefined) updates.contact_name = contactName;
+  if (contactEmail !== undefined) updates.contact_email = contactEmail;
+  if (contactPhone !== undefined) updates.contact_phone = contactPhone;
+
+  const { error: convError } = await supabase
+    .from('conversations')
+    .update(updates)
+    .eq('id', conversation.id);
+
+  if (convError) throw convError;
 
   if (role === 'user') {
     await resetInactivityWarning(conversation.id);
   }
   
-  return result[0];
+  return log as unknown as ChatLog;
 }
 
 export async function getConversationHistory(input: GetHistoryInput): Promise<{
@@ -127,99 +139,96 @@ export async function getConversationHistory(input: GetHistoryInput): Promise<{
 }> {
   const { sessionId, limit } = getHistorySchema.parse(input);
   
-  const conversations = await sql<Conversation[]>`
-    SELECT * FROM conversations 
-    WHERE session_id = ${sessionId}
-    LIMIT 1
-  `;
+  const { data: conversation, error: convError } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('session_id', sessionId)
+    .maybeSingle();
   
-  if (!conversations[0]) {
+  if (convError || !conversation) {
     return { conversation: null, messages: [] };
   }
   
-  const conversation = conversations[0];
+  const { data: logs, error: logsError } = await supabase
+    .from('chat_logs')
+    .select('*')
+    .eq('conversation_id', conversation.id)
+    .neq('role', 'tool')
+    .order('created_at', { ascending: true })
+    .limit(limit);
   
-  const logs = await sql<ChatLog[]>`
-    SELECT * FROM chat_logs 
-    WHERE conversation_id = ${conversation.id}
-      AND role != 'tool'
-    ORDER BY created_at ASC
-    LIMIT ${limit}
-  `;
+  if (logsError) throw logsError;
   
-  const messages: ConversationMessage[] = logs.map(log => ({
+  const messages: ConversationMessage[] = (logs || []).map(log => ({
     role: log.role as MessageRole,
     content: log.content,
     toolName: log.tool_name || undefined,
     createdAt: log.created_at,
   }));
   
-  return { conversation, messages };
+  return { conversation: conversation as unknown as Conversation, messages };
 }
 
 export async function updateClientInfo(input: UpdateClientInfoInput): Promise<Conversation> {
   const { sessionId, identification, contract, sector, contactName, contactEmail, contactPhone } = 
     updateClientInfoSchema.parse(input);
   
-  const updates: Record<string, unknown> = {};
+  const conversation = await getOrCreateConversation(sessionId);
+  
+  const updates: Record<string, any> = { updated_at: new Date().toISOString() };
   if (identification !== undefined) updates.identification = identification;
   if (contract !== undefined) updates.contract = contract;
   if (sector !== undefined) updates.sector = sector;
   if (contactName !== undefined) updates.contact_name = contactName;
   if (contactEmail !== undefined) updates.contact_email = contactEmail;
   if (contactPhone !== undefined) updates.contact_phone = contactPhone;
+
+  const { data, error } = await supabase
+    .from('conversations')
+    .update(updates)
+    .eq('id', conversation.id)
+    .select()
+    .single();
   
-  const conversation = await getOrCreateConversation(sessionId);
-  
-  const result = await sql<Conversation[]>`
-    UPDATE conversations
-    SET 
-      identification = COALESCE(${identification || null}, identification),
-      contract = COALESCE(${contract || null}, contract),
-      sector = COALESCE(${sector || null}, sector),
-      contact_name = COALESCE(${contactName || null}, contact_name),
-      contact_email = COALESCE(${contactEmail || null}, contact_email),
-      contact_phone = COALESCE(${contactPhone || null}, contact_phone),
-      updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
-  
-  return result[0];
+  if (error) throw error;
+  return data as unknown as Conversation;
 }
 
 export async function updateSummary(sessionId: string, summary: string): Promise<Conversation> {
   const conversation = await getOrCreateConversation(sessionId);
   
-  const result = await sql<Conversation[]>`
-    UPDATE conversations
-    SET summary = ${summary}, updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data, error } = await supabase
+    .from('conversations')
+    .update({ summary, updated_at: new Date().toISOString() })
+    .eq('id', conversation.id)
+    .select()
+    .single();
   
-  return result[0];
+  if (error) throw error;
+  return data as unknown as Conversation;
 }
 
 export async function updateStatus(sessionId: string, status: ConversationStatus): Promise<Conversation> {
   const conversation = await getOrCreateConversation(sessionId);
   
-  const result = await sql<Conversation[]>`
-    UPDATE conversations
-    SET status = ${status}, updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data, error } = await supabase
+    .from('conversations')
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq('id', conversation.id)
+    .select()
+    .single();
   
-  return result[0];
+  if (error) throw error;
+  return data as unknown as Conversation;
 }
 
 export async function getConversation(sessionId: string): Promise<Conversation | null> {
-  const result = await sql<Conversation[]>`
-    SELECT * FROM conversations
-    WHERE session_id = ${sessionId}
-    LIMIT 1
-  `;
+  const { data, error } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('session_id', sessionId)
+    .maybeSingle();
   
-  return result[0] || null;
+  if (error) throw error;
+  return data as unknown as Conversation | null;
 }
