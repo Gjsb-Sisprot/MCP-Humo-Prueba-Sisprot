@@ -1,144 +1,170 @@
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { Hono } from 'hono';
+import { supabase } from '../db/index.js';
+import type { Conversation, ChatLog } from '../db/types.js';
+import { closeConversation } from './handover.js';
+import { emit } from '../lib/event-bus.js';
 
-import { createApiKey } from '../services/api-keys.js';
-import { deleteKnowledgeBySource } from '../services/knowledge.js';
-import { sql } from '../db/index.js';
-import { checkDatabaseConnection } from '../db/index.js';
-import { getAllCacheStats, clearAllCaches } from '../lib/cache.js';
-import { getActiveSessionCount } from './mcp.js';
-import { validateAuthInline, REQUIRE_AUTH } from '../middleware/auth.js';
-import { getInactivityStats } from '../services/inactivity.js';
+const WARN_MINUTES = parseInt(process.env.INACTIVITY_WARN_MINUTES || '15', 10);
+const CLOSE_MINUTES = parseInt(process.env.INACTIVITY_CLOSE_MINUTES || '15', 10);
+const CHECK_INTERVAL_MS = parseInt(process.env.INACTIVITY_CHECK_INTERVAL_MS || '120000', 10); 
 
-const VERSION = '1.3.0';
+const WARNING_MESSAGE = process.env.INACTIVITY_WARNING_MESSAGE
+  || 'Hemos notado que no hay actividad en esta conversación. Si no recibimos respuesta en 15 minutos, se cerrará automáticamente.';
 
-const adminRouter = new Hono();
+const CLOSE_MESSAGE = 'Esta conversación fue cerrada automáticamente por inactividad del cliente. '
+  + 'Si necesitas ayuda nuevamente, no dudes en contactarnos.';
 
-adminRouter.get('/health', async (c) => {
-  const dbConnected = await checkDatabaseConnection();
-  const cacheStats = getAllCacheStats();
-  const inactivity = getInactivityStats();
-  
-  return c.json({
-    status: 'ok',
-    version: VERSION,
-    timestamp: new Date().toISOString(),
-    database: dbConnected ? 'connected' : 'disconnected',
-    activeSessions: getActiveSessionCount(),
-    cache: cacheStats,
-    inactivity,
-  });
-});
+let schedulerInterval: ReturnType<typeof setInterval> | null = null;
+let isRunning = false;
+let lastRunAt: Date | null = null;
+let stats = { warned: 0, closed: 0, errors: 0, runs: 0 };
 
-adminRouter.get('/cache/stats', (c) => {
-  return c.json(getAllCacheStats());
-});
-
-adminRouter.post('/cache/clear', (c) => {
-  clearAllCaches();
-  return c.json({ success: true, message: 'Todos los caches limpiados' });
-});
-
-adminRouter.get('/admin/inactivity', (c) => {
-  return c.json(getInactivityStats());
-});
-
-adminRouter.use('/debug/cleanup/*', async (c, next) => {
-  const authError = await validateAuthInline(c);
-  if (authError) return authError;
-  return next();
-});
-
-adminRouter.delete('/debug/cleanup/:type', async (c) => {
-  const type = c.req.param('type');
-  
-  try {
-    if (type === 'knowledge') {
-      const result = await deleteKnowledgeBySource('test_mcp_debug');
-      return c.json({ success: true, deletedCount: result.deletedCount, message: 'Documentos de prueba eliminados' });
-    }
-    
-    if (type === 'conversations') {
-      const result = await sql`
-        DELETE FROM conversations 
-        WHERE session_id LIKE 'test-debug-%'
-        RETURNING session_id
-      `;
-      return c.json({ success: true, deletedCount: result.length, message: 'Conversaciones de prueba eliminadas' });
-    }
-    
-    if (type === 'session_state') {
-      const result = await sql`
-        DELETE FROM session_state 
-        WHERE session_id LIKE 'test-%'
-        RETURNING id
-      `;
-      return c.json({ success: true, deletedCount: result.length, message: 'Session states de prueba eliminados' });
-    }
-    
-    return c.json({ success: false, error: 'Tipo no válido. use: knowledge, conversations, session_state' }, 400);
-  } catch (error) {
-    return c.json({ success: false, error: String(error) }, 500);
+export function startInactivityScheduler(): void {
+  if (schedulerInterval) {
+    return;
   }
-});
 
-function serveDebugFile(filePath: string, contentType: string) {
-  try {
-    const fullPath = join(process.cwd(), 'public', 'debug', filePath);
-    const content = readFileSync(fullPath, 'utf-8');
-    return new Response(content, {
-      headers: { 'Content-Type': contentType, 'Cache-Control': 'no-cache' },
+  processInactiveConversations().catch(err => {
+  });
+
+  schedulerInterval = setInterval(() => {
+    processInactiveConversations().catch(err => {
+      stats.errors++;
     });
-  } catch {
-    return new Response('File not found: ' + filePath, { status: 404 });
+  }, CHECK_INTERVAL_MS);
+}
+
+export function stopInactivityScheduler(): void {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+    schedulerInterval = null;
   }
 }
 
-adminRouter.get('/debug', (c) => serveDebugFile('index.html', 'text/html; charset=utf-8'));
-adminRouter.get('/debug/styles.css', (c) => serveDebugFile('styles.css', 'text/css; charset=utf-8'));
-adminRouter.get('/debug/mcp-client.js', (c) => serveDebugFile('mcp-client.js', 'application/javascript; charset=utf-8'));
-adminRouter.get('/debug/app.js', (c) => serveDebugFile('app.js', 'application/javascript; charset=utf-8'));
+export function getInactivityStats() {
+  return {
+    running: schedulerInterval !== null,
+    lastRunAt: lastRunAt?.toISOString() || null,
+    config: {
+      warnMinutes: WARN_MINUTES,
+      closeMinutes: CLOSE_MINUTES,
+      checkIntervalMs: CHECK_INTERVAL_MS,
+    },
+    stats: { ...stats },
+  };
+}
 
-adminRouter.post('/admin/api-keys', async (c) => {
-  const adminSecret = process.env.ADMIN_SECRET;
-  if (!adminSecret) {
-    return c.json({ error: 'ADMIN_SECRET no configurado en el servidor' }, 503);
-  }
+export async function resetInactivityWarning(conversationId: string): Promise<void> {
+  await supabase
+    .from('conversations')
+    .update({ inactivity_warned_at: null })
+    .eq('id', conversationId)
+    .not('inactivity_warned_at', 'is', null);
+}
 
-  const authHeader = c.req.header('Authorization');
-  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (token !== adminSecret) {
-    return c.json({ error: 'Unauthorized: admin secret inválido' }, 401);
-  }
+async function processInactiveConversations(): Promise<void> {
+  if (isRunning) return; 
+  isRunning = true;
 
   try {
-    const body = await c.req.json() as { name: string; description?: string; expiresInDays?: number };
-    if (!body.name) {
-      return c.json({ error: 'Campo "name" es requerido' }, 400);
-    }
+    const warnedCount = await warnInactiveConversations();
+    const closedCount = await closeTimedOutConversations();
 
-    const expiresAt = body.expiresInDays
-      ? new Date(Date.now() + body.expiresInDays * 24 * 60 * 60 * 1000)
-      : undefined;
-
-    const result = await createApiKey({
-      name: body.name,
-      description: body.description,
-      expiresAt,
-    });
-
-    return c.json({
-      success: true,
-      message: '⚠️ Guarda esta key, no se puede recuperar después',
-      apiKey: result.key,
-      keyId: result.keyId,
-      prefix: result.prefix,
-    }, 201);
-  } catch (error) {
-    return c.json({ error: 'Error creando API key', details: (error as Error).message }, 500);
+    stats.runs++;
+    lastRunAt = new Date();
+  } finally {
+    isRunning = false;
   }
-});
+}
 
-export { adminRouter };
+async function warnInactiveConversations(): Promise<number> {
+  const warnThreshold = new Date(Date.now() - WARN_MINUTES * 60 * 1000).toISOString();
+  
+  // Fetch active conversations that haven't been warned yet
+  const { data: convs, error } = await supabase
+    .from('conversations')
+    .select('*, chat_logs(role, created_at)')
+    .eq('status', 'active')
+    .is('inactivity_warned_at', null);
+
+  if (error || !convs) return 0;
+
+  let count = 0;
+  for (const conv of convs) {
+    // Get last message manually because we don't want to use RPC yet
+    const logs = conv.chat_logs as any[];
+    if (!logs || logs.length === 0) continue;
+
+    const lastLog = logs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+    
+    // Only warn if the last message was from the bot/system and is old
+    if (['model', 'assistant', 'system'].includes(lastLog.role) && lastLog.created_at < warnThreshold) {
+      try {
+        await supabase
+          .from('chat_logs')
+          .insert({ conversation_id: conv.id, role: 'system', content: WARNING_MESSAGE });
+
+        await supabase
+          .from('conversations')
+          .update({ inactivity_warned_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq('id', conv.id);
+
+        stats.warned++;
+        count++;
+
+        emit({
+          type: 'new_message',
+          sessionId: conv.session_id,
+          data: { role: 'system', content: WARNING_MESSAGE },
+          timestamp: new Date().toISOString(),
+        });
+      } catch (err) {
+        stats.errors++;
+      }
+    }
+  }
+
+  return count;
+}
+
+async function closeTimedOutConversations(): Promise<number> {
+  const closeThreshold = new Date(Date.now() - CLOSE_MINUTES * 60 * 1000).toISOString();
+  
+  const { data: convs, error } = await supabase
+    .from('conversations')
+    .select('*, chat_logs(role, created_at)')
+    .eq('status', 'active')
+    .not('inactivity_warned_at', 'is', null)
+    .lt('inactivity_warned_at', closeThreshold);
+
+  if (error || !convs) return 0;
+
+  let count = 0;
+  for (const conv of convs) {
+    try {
+      // Check if user has replied since warning
+      const logs = conv.chat_logs as any[];
+      const userReplied = logs.some(l => l.role === 'user' && l.created_at > conv.inactivity_warned_at);
+      
+      if (!userReplied) {
+        await supabase
+          .from('chat_logs')
+          .insert({ conversation_id: conv.id, role: 'system', content: CLOSE_MESSAGE });
+
+        await closeConversation({
+          sessionId: conv.session_id,
+          resolution: 'Conversación cerrada automáticamente por inactividad del cliente.',
+          closedBy: 'system',
+          createTicket: true,
+        });
+
+        stats.closed++;
+        count++;
+      }
+    } catch (err) {
+      stats.errors++;
+    }
+  }
+
+  return count;
+}
