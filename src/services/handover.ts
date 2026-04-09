@@ -1,6 +1,6 @@
 
 import { z } from 'zod';
-import { sql } from '../db/index.js';
+import { supabase } from '../db/index.js';
 import type { Conversation, ConversationStatus, ChatLog } from '../db/types.js';
 import { repairMojibake } from '../lib/text.js';
 import { getOrCreateConversation, updateSummary, updateStatus } from './conversation.js';
@@ -79,20 +79,24 @@ export interface CloseResult {
 }
 
 async function getConversationMessages(conversationId: string, limit = 50): Promise<ChatLog[]> {
-  return sql<ChatLog[]>`
-    SELECT * FROM chat_logs
-    WHERE conversation_id = ${conversationId}
-    ORDER BY created_at ASC
-    LIMIT ${limit}
-  `;
+  const { data, error } = await supabase
+    .from('chat_logs')
+    .select('*')
+    .eq('conversation_id', conversationId)
+    .order('created_at', { ascending: true })
+    .limit(limit);
+  
+  if (error) throw error;
+  return (data || []) as unknown as ChatLog[];
 }
 
 async function saveGlpiTicketId(conversationId: string, ticketId: number): Promise<void> {
-  await sql`
-    UPDATE conversations
-    SET glpi_ticket_id = ${ticketId}, updated_at = NOW()
-    WHERE id = ${conversationId}
-  `;
+  const { error } = await supabase
+    .from('conversations')
+    .update({ glpi_ticket_id: ticketId, updated_at: new Date().toISOString() })
+    .eq('id', conversationId);
+  
+  if (error) throw error;
 }
 
 export async function escalateToSpecialist(input: EscalateInput): Promise<EscalationResult> {
@@ -119,31 +123,35 @@ export async function escalateToSpecialist(input: EscalateInput): Promise<Escala
     await updateSummary(sessionId, summary);
   }
 
-  const updated = await sql<Conversation[]>`
-    UPDATE conversations
-    SET
-      status = 'waiting_specialist',
-      escalation_reason = ${reason},
-      escalated_at = NOW(),
-      updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data: updated, error: updateError } = await supabase
+    .from('conversations')
+    .update({
+      status: 'waiting_specialist',
+      escalation_reason: reason,
+      escalated_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', conversation.id)
+    .select()
+    .single();
 
-  await sql`
-    INSERT INTO chat_logs (conversation_id, role, content)
-    VALUES (
-      ${conversation.id},
-      'system',
-      ${`Escalado a especialista: ${reason}`}
-    )
-  `;
+  if (updateError) throw updateError;
+
+  const { error: logError } = await supabase
+    .from('chat_logs')
+    .insert({
+      conversation_id: conversation.id,
+      role: 'system',
+      content: `Escalado a especialista: ${reason}`
+    });
+
+  if (logError) throw logError;
 
   emitStatusChange(sessionId, 'waiting_specialist', { reason });
 
   return {
     success: true,
-    conversation: updated[0],
+    conversation: updated as unknown as Conversation,
     message: `Conversación escalada. Un especialista la atenderá pronto.`,
   };
 }
@@ -153,56 +161,59 @@ export async function takeoverConversation(input: TakeoverInput): Promise<Takeov
 
   const conversation = await getOrCreateConversation(sessionId);
 
-  const result = await sql<Conversation[]>`
-    UPDATE conversations
-    SET
-      status = 'handed_over',
-      specialist_id = ${specialistEmail},
-      specialist_name = ${specialistName},
-      taken_at = NOW(),
-      updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data: updated, error: updateError } = await supabase
+    .from('conversations')
+    .update({
+      status: 'handed_over',
+      specialist_id: specialistEmail,
+      specialist_name: specialistName,
+      taken_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', conversation.id)
+    .select()
+    .single();
 
-  await sql`
-    INSERT INTO chat_logs (conversation_id, role, content)
-    VALUES (
-      ${conversation.id},
-      'system',
-      ${`Especialista ${specialistName} tomó la conversación`}
-    )
-  `;
+  if (updateError) throw updateError;
+
+  const { error: logError } = await supabase
+    .from('chat_logs')
+    .insert({
+      conversation_id: conversation.id,
+      role: 'system',
+      content: `Especialista ${specialistName} tomó la conversación`
+    });
+
+  if (logError) throw logError;
 
   emitStatusChange(sessionId, 'handed_over', { specialistName, specialistEmail });
 
   let ticket: GLPITicketResult | undefined;
+  let finalConv = updated as unknown as Conversation;
+
   if (createTicket) {
     const messages = await getConversationMessages(conversation.id);
     const ticketReason = reason || conversation.escalation_reason || `Tomada por ${specialistName}`;
 
-    const updatedConv = result[0];
-
     ticket = await createConversationTicket({
-      conversation: updatedConv,
+      conversation: finalConv,
       messages,
       reason: ticketReason,
     });
 
     if (ticket.success && ticket.ticketId) {
       await saveGlpiTicketId(conversation.id, ticket.ticketId);
-      result[0].glpi_ticket_id = ticket.ticketId;
+      finalConv.glpi_ticket_id = ticket.ticketId;
 
       const customerTicketMessage = `Tu caso fue registrado con el número de ticket #${ticket.ticketId}.`; 
 
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'system',
-          ${customerTicketMessage}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'system',
+          content: customerTicketMessage
+        });
 
       emit({
         type: 'new_message',
@@ -211,20 +222,19 @@ export async function takeoverConversation(input: TakeoverInput): Promise<Takeov
         timestamp: new Date().toISOString(),
       });
     } else if (ticket && !ticket.success) {
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'tool',
-          ${`Error creando ticket al tomar: ${ticket.error}`}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'tool',
+          content: `Error creando ticket al tomar: ${ticket.error}`
+        });
     }
   }
 
   return {
     success: true,
-    conversation: result[0],
+    conversation: finalConv,
     message: ticket?.success
       ? `Especialista ${specialistName} tomó la conversación. Ticket #${ticket.ticketId} creado.`
       : `Especialista ${specialistName} tomó la conversación`,
@@ -238,63 +248,71 @@ export async function pauseConversation(input: PauseInput): Promise<PauseResult>
   const conversation = await getOrCreateConversation(sessionId);
 
   if (specialistName && !conversation.specialist_name) {
-    await sql`
-      UPDATE conversations
-      SET specialist_name = ${specialistName},
-          specialist_id = ${specialistEmail || conversation.specialist_id || null},
-          updated_at = NOW()
-      WHERE id = ${conversation.id}
-    `;
+    const { error: updateError } = await supabase
+      .from('conversations')
+      .update({
+        specialist_name: specialistName,
+        specialist_id: specialistEmail || conversation.specialist_id || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', conversation.id);
+    
+    if (updateError) throw updateError;
     conversation.specialist_name = specialistName;
     if (specialistEmail) conversation.specialist_id = specialistEmail;
   }
 
-  const updated = await sql<Conversation[]>`
-    UPDATE conversations
-    SET
-      status = 'paused',
-      escalation_reason = ${reason},
-      updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data: updated, error: statusError } = await supabase
+    .from('conversations')
+    .update({
+      status: 'paused',
+      escalation_reason: reason,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', conversation.id)
+    .select()
+    .single();
+
+  if (statusError) throw statusError;
 
   const pausedByLabel = conversation.specialist_name || 'Sistema';
-  await sql`
-    INSERT INTO chat_logs (conversation_id, role, content)
-    VALUES (
-      ${conversation.id},
-      'system',
-      ${`Conversación pausada por ${pausedByLabel}: ${reason}`}
-    )
-  `;
+  const { error: logError } = await supabase
+    .from('chat_logs')
+    .insert({
+      conversation_id: conversation.id,
+      role: 'system',
+      content: `Conversación pausada por ${pausedByLabel}: ${reason}`
+    });
+
+  if (logError) throw logError;
 
   emitStatusChange(sessionId, 'paused', { reason, pausedBy: pausedByLabel });
 
   let ticket: GLPITicketResult | undefined;
+  let finalConv = updated as unknown as Conversation;
+
   if (createTicket) {
     const messages = await getConversationMessages(conversation.id);
 
     ticket = await createConversationTicket({
-      conversation: updated[0],
+      conversation: finalConv,
       messages,
       reason,
     });
 
     if (ticket.success && ticket.ticketId) {
       await saveGlpiTicketId(conversation.id, ticket.ticketId);
-      updated[0].glpi_ticket_id = ticket.ticketId;
+      finalConv.glpi_ticket_id = ticket.ticketId;
 
       const customerTicketMessage = `Tu caso fue registrado con el número de ticket #${ticket.ticketId}.`;
 
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'system',
-          ${customerTicketMessage}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'system',
+          content: customerTicketMessage
+        });
 
       emit({
         type: 'new_message',
@@ -303,20 +321,19 @@ export async function pauseConversation(input: PauseInput): Promise<PauseResult>
         timestamp: new Date().toISOString(),
       });
     } else if (!ticket.success) {
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'tool',
-          ${`Error creando ticket: ${ticket.error}`}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'tool',
+          content: `Error creando ticket: ${ticket.error}`
+        });
     }
   }
 
   return {
     success: true,
-    conversation: updated[0],
+    conversation: finalConv,
     message: ticket?.success
       ? `Conversación pausada. Ticket #${ticket.ticketId} creado.`
       : `Conversación pausada: ${reason}`,
@@ -330,44 +347,49 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
   const conversation = await getOrCreateConversation(sessionId);
 
   if (specialistName && !conversation.specialist_name) {
-    await sql`
-      UPDATE conversations
-      SET specialist_name = ${specialistName},
-          specialist_id = ${specialistEmail || conversation.specialist_id || null},
-          updated_at = NOW()
-      WHERE id = ${conversation.id}
-    `;
+    const { error: updateError } = await supabase
+      .from('conversations')
+      .update({
+        specialist_name: specialistName,
+        specialist_id: specialistEmail || conversation.specialist_id || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', conversation.id);
+    
+    if (updateError) throw updateError;
     conversation.specialist_name = specialistName;
     if (specialistEmail) conversation.specialist_id = specialistEmail;
   }
 
-  const updated = await sql<Conversation[]>`
-    UPDATE conversations
-    SET
-      status = 'closed',
-      closed_at = NOW(),
-      closed_by = ${closedBy},
-      updated_at = NOW()
-    WHERE id = ${conversation.id}
-    RETURNING *
-  `;
+  const { data: updated, error: statusError } = await supabase
+    .from('conversations')
+    .update({
+      status: 'closed',
+      closed_at: new Date().toISOString(),
+      closed_by: closedBy,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', conversation.id)
+    .select()
+    .single();
 
-  const closedByLabel = closedBy === 'agent'
-    ? (conversation.specialist_name || 'Especialista')
-    : closedBy === 'user' ? 'el usuario' : 'Sistema';
+  if (statusError) throw statusError;
+
+  const finalConv = updated as unknown as Conversation;
   const closedByClientLabel = closedBy === 'agent'
     ? (conversation.specialist_name || 'un especialista')
     : closedBy === 'user' ? 'el usuario' : 'el sistema';
   const closedMessage = `La conversación fue cerrada por ${closedByClientLabel}.`;
 
-  await sql`
-    INSERT INTO chat_logs (conversation_id, role, content)
-    VALUES (
-      ${conversation.id},
-      'system',
-      ${closedMessage}
-    )
-  `;
+  const { error: logError } = await supabase
+    .from('chat_logs')
+    .insert({
+      conversation_id: conversation.id,
+      role: 'system',
+      content: closedMessage
+    });
+
+  if (logError) throw logError;
 
   emitStatusChange(sessionId, 'closed', { closedBy, resolution });
   emit({
@@ -380,9 +402,8 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
   let ticket: GLPITicketResult | GLPICloseResult | undefined;
 
   if (conversation.glpi_ticket_id) {
-    
     const messages = await getConversationMessages(conversation.id);
-    const solutionHtml = buildCloseResolution(resolution, updated[0], messages, conversation.status);
+    const solutionHtml = buildCloseResolution(resolution, finalConv, messages, conversation.status);
 
     ticket = await closeTicket({
       ticketId: conversation.glpi_ticket_id,
@@ -392,14 +413,13 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
     if (ticket.success) {
       const customerTicketMessage = `Tu caso quedó registrado con el número de ticket #${conversation.glpi_ticket_id}.`;
 
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'system',
-          ${customerTicketMessage}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'system',
+          content: customerTicketMessage
+        });
 
       emit({
         type: 'new_message',
@@ -408,27 +428,25 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
         timestamp: new Date().toISOString(),
       });
     } else {
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'tool',
-          ${`Error cerrando ticket #${conversation.glpi_ticket_id}: ${ticket.error}`}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'tool',
+          content: `Error cerrando ticket #${conversation.glpi_ticket_id}: ${ticket.error}`
+        });
     }
   } else if (createTicket) {
-    
     const messages = await getConversationMessages(conversation.id);
     const reason = conversation.escalation_reason || resolution;
 
     const result = await createAndCloseTicket(
       {
-        conversation: updated[0],
+        conversation: finalConv,
         messages,
         reason,
-              previousStatus: conversation.status,
-        },
+        previousStatus: conversation.status,
+      },
       resolution
     );
 
@@ -436,18 +454,17 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
 
     if (result.success && result.ticketId) {
       await saveGlpiTicketId(conversation.id, result.ticketId);
-      updated[0].glpi_ticket_id = result.ticketId;
+      finalConv.glpi_ticket_id = result.ticketId;
 
       const customerTicketMessage = `Tu caso quedó registrado con el número de ticket #${result.ticketId}.`;
 
-      await sql`
-        INSERT INTO chat_logs (conversation_id, role, content)
-        VALUES (
-          ${conversation.id},
-          'system',
-          ${customerTicketMessage}
-        )
-      `;
+      await supabase
+        .from('chat_logs')
+        .insert({
+          conversation_id: conversation.id,
+          role: 'system',
+          content: customerTicketMessage
+        });
 
       emit({
         type: 'new_message',
@@ -460,7 +477,7 @@ export async function closeConversation(input: CloseInput): Promise<CloseResult>
   
   return {
     success: true,
-    conversation: updated[0],
+    conversation: finalConv,
     message: ticket?.success
       ? `Conversación cerrada. Ticket ${ticket.ticketId ? `#${ticket.ticketId}` : ''} procesado.`
       : `Conversación cerrada: ${resolution}`,
@@ -482,15 +499,13 @@ export async function getConversationStatus(sessionId: string): Promise<{
     phone: string | null;
   };
 } | null> {
-  const result = await sql<Conversation[]>`
-    SELECT * FROM conversations
-    WHERE session_id = ${sessionId}
-    LIMIT 1
-  `;
+  const { data: conv, error } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('session_id', sessionId)
+    .maybeSingle();
 
-  if (!result[0]) return null;
-
-  const conv = result[0];
+  if (error || !conv) return null;
 
   return {
     status: conv.status,
