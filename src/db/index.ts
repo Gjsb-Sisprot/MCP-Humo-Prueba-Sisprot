@@ -15,16 +15,26 @@ export const supabase = createClient(SUPABASE_URL || '', SUPABASE_KEY || '', {
   }
 });
 
-export async function checkDatabaseConnection(): Promise<boolean> {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return false;
+export async function checkDatabaseConnection(): Promise<{ connected: boolean; error?: string; missingVars?: string[] }> {
+  const missing = [];
+  if (!process.env.SUPABASE_URL) missing.push('SUPABASE_URL');
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY && !process.env.SUPABASE_ANON_KEY) missing.push('SUPABASE_SERVICE_ROLE_KEY/ANON_KEY');
+  
+  if (missing.length > 0) {
+    return { connected: false, missingVars: missing };
+  }
   
   try {
-    const { error } = await supabase.from('conversations').select('count', { count: 'exact', head: true }).limit(1);
-    if (error) throw error;
-    return true;
-  } catch (error) {
-    console.error('Error connecting to Supabase:', error);
-    return false;
+    // Intentamos una consulta simple que no dependa de políticas RLS complejas si usamos service_role
+    const { error, data } = await supabase.from('conversations').select('id').limit(1);
+    
+    if (error) {
+      return { connected: false, error: `${error.code}: ${error.message}` };
+    }
+    
+    return { connected: true };
+  } catch (err) {
+    return { connected: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
