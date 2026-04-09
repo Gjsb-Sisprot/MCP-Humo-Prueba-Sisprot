@@ -1,36 +1,31 @@
 
-import postgres from 'postgres';
+import { createClient } from '@supabase/supabase-js';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-if (!DATABASE_URL) {
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.warn('⚠️ SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY no configurados. Las funciones de DB podrían fallar.');
 }
 
-export const sql = postgres(DATABASE_URL || '', {
-  ssl: { rejectUnauthorized: false },
-  max: 20,               
-  idle_timeout: 60,       
-  connect_timeout: 10,    
-  prepare: true,          
-  fetch_types: false,     
-  onnotice: () => {},     
-});
-
-sql`SET hnsw.ef_search = 40`.catch(() => {
-  
+export const supabase = createClient(SUPABASE_URL || '', SUPABASE_KEY || '', {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  }
 });
 
 export async function checkDatabaseConnection(): Promise<boolean> {
-  if (!DATABASE_URL) {
-    return false;
-  }
+  if (!SUPABASE_URL || !SUPABASE_KEY) return false;
   
   try {
-    await sql`SELECT 1 as connected`;
+    const { error } = await supabase.from('conversations').select('count', { count: 'exact', head: true }).limit(1);
+    if (error) throw error;
     return true;
   } catch (error) {
+    console.error('Error connecting to Supabase:', error);
     return false;
   }
 }
 
-export default sql;
+export default supabase;
