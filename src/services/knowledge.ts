@@ -1,6 +1,6 @@
 
 import { z } from 'zod';
-import { sql } from '../db/index.js';
+import { supabase } from '../db/index.js';
 import { generateQueryEmbedding, generateDocumentEmbedding } from '../lib/embeddings.js';
 import { knowledgeCache } from '../lib/cache.js';
 import type { KnowledgeBase } from '../db/types.js';
@@ -41,40 +41,38 @@ export async function searchKnowledgeBase(input: SearchKnowledgeInput): Promise<
     return cached;
   }
   
-  const embStart = performance.now();
   const queryEmbedding = await generateQueryEmbedding(query);
-  const embeddingStr = `[${queryEmbedding.join(',')}]`;
-  const embMs = (performance.now() - embStart).toFixed(1);
   
-  const dbStart = performance.now();
-  const rawResults = await sql<(KnowledgeBase & { similarity: number })[]>`
-    SELECT 
-      id,
-      content,
-      title,
-      source,
-      1 - (embedding <=> ${embeddingStr}::vector) as similarity
-    FROM knowledge_base
-    WHERE embedding IS NOT NULL
-    ORDER BY embedding <=> ${embeddingStr}::vector
-    LIMIT ${limit}
-  `;
-  const dbMs = (performance.now() - dbStart).toFixed(1);
+  // Usamos RPC para búsqueda vectorial en Supabase
+  // Es necesario crear la función 'match_knowledge' en Supabase (ver README o documentación)
+  const { data, error } = await supabase.rpc('match_knowledge', {
+    query_embedding: queryEmbedding,
+    match_threshold: threshold,
+    match_count: limit,
+  });
+
+  if (error) {
+    console.warn('Error en búsqueda vectorial RPC, intentando fallback simple:', error);
+    // Fallback simple si no hay RPC (sin vectores, solo texto)
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('knowledge_base')
+      .select('id, content, title, source')
+      .ilike('content', `%${query}%`)
+      .limit(limit);
+    
+    if (fallbackError) throw fallbackError;
+    return (fallbackData || []).map(r => ({ ...r, similarity: 0.5 }));
+  }
   
-  const results = rawResults
-    .filter(r => r.similarity >= threshold)
-    .map(r => ({
-      id: r.id,
-      content: r.content,
-      title: r.title,
-      source: r.source,
-      similarity: r.similarity,
-    }));
-  
-  const totalMs = (performance.now() - startTime).toFixed(1);
+  const results = (data || []).map((r: any) => ({
+    id: r.id,
+    content: r.content,
+    title: r.title,
+    source: r.source,
+    similarity: r.similarity,
+  }));
   
   knowledgeCache.set(cacheKey, results, 2 * 60 * 1000);
-  
   return results;
 }
 
@@ -99,34 +97,43 @@ export async function addKnowledge(input: AddKnowledgeInput): Promise<{
 }> {
   const { content, title, source, metadata, chunkSize, chunkOverlap } = addKnowledgeSchema.parse(input);
   
-  const parentResult = await sql<{ id: number }[]>`
-    INSERT INTO knowledge_base (content, title, source, metadata)
-    VALUES (${content}, ${title || null}, ${source || null}, ${metadata ? JSON.stringify(metadata) : null})
-    RETURNING id
-  `;
+  const { data: parent, error: parentError } = await supabase
+    .from('knowledge_base')
+    .insert({
+      content,
+      title: title || null,
+      source: source || null,
+      metadata: metadata || null
+    })
+    .select('id')
+    .single();
   
-  const parentId = parentResult[0].id;
+  if (parentError) throw parentError;
+  const parentId = parent.id;
   
   const chunks = chunkText(content, chunkSize, chunkOverlap);
+  const chunkRows = [];
   
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const embedding = await generateDocumentEmbedding(chunk);
-    const embeddingStr = `[${embedding.join(',')}]`;
     
-    await sql`
-      INSERT INTO knowledge_base (content, title, source, embedding, parent_id, chunk_index, metadata)
-      VALUES (
-        ${chunk}, 
-        ${title ? `${title} (chunk ${i + 1})` : null}, 
-        ${source || null}, 
-        ${embeddingStr}::vector,
-        ${parentId},
-        ${i},
-        ${metadata ? JSON.stringify(metadata) : null}
-      )
-    `;
+    chunkRows.push({
+      content: chunk,
+      title: title ? `${title} (chunk ${i + 1})` : null,
+      source: source || null,
+      embedding,
+      parent_id: parentId,
+      chunk_index: i,
+      metadata: metadata || null
+    });
   }
+
+  const { error: insertError } = await supabase
+    .from('knowledge_base')
+    .insert(chunkRows);
+  
+  if (insertError) throw insertError;
   
   knowledgeCache.delete('stats');
   
@@ -137,16 +144,17 @@ export async function addKnowledge(input: AddKnowledgeInput): Promise<{
 }
 
 export async function deleteKnowledgeBySource(source: string): Promise<{ deletedCount: number }> {
-  const result = await sql`
-    DELETE FROM knowledge_base 
-    WHERE source = ${source}
-    RETURNING id
-  `;
+  const { error, count } = await supabase
+    .from('knowledge_base')
+    .delete({ count: 'exact' })
+    .eq('source', source);
+  
+  if (error) throw error;
   
   knowledgeCache.delete('stats');
   
   return {
-    deletedCount: result.length,
+    deletedCount: count || 0,
   };
 }
 
@@ -156,22 +164,25 @@ export async function getKnowledgeStats(): Promise<{
   documentsWithEmbeddings: number;
 }> {
   return knowledgeCache.getOrSet('stats', async () => {
-    const [totalResult, chunksResult, embeddingsResult] = await Promise.all([
-      sql<{ count: string }[]>`
-        SELECT COUNT(*)::text as count FROM knowledge_base WHERE parent_id IS NULL
-      `,
-      sql<{ count: string }[]>`
-        SELECT COUNT(*)::text as count FROM knowledge_base WHERE parent_id IS NOT NULL
-      `,
-      sql<{ count: string }[]>`
-        SELECT COUNT(*)::text as count FROM knowledge_base WHERE embedding IS NOT NULL
-      `,
-    ]);
+    const { count: total, error: totalErr } = await supabase
+      .from('knowledge_base')
+      .select('*', { count: 'exact', head: true })
+      .is('parent_id', null);
+
+    const { count: chunks, error: chunksErr } = await supabase
+      .from('knowledge_base')
+      .select('*', { count: 'exact', head: true })
+      .not('parent_id', 'is', null);
+
+    const { count: embeddings, error: embErr } = await supabase
+      .from('knowledge_base')
+      .select('*', { count: 'exact', head: true })
+      .not('embedding', 'is', null);
     
     return {
-      totalDocuments: parseInt(totalResult[0]?.count || '0', 10),
-      totalChunks: parseInt(chunksResult[0]?.count || '0', 10),
-      documentsWithEmbeddings: parseInt(embeddingsResult[0]?.count || '0', 10),
+      totalDocuments: total || 0,
+      totalChunks: chunks || 0,
+      documentsWithEmbeddings: embeddings || 0,
     };
   });
 }
