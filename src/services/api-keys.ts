@@ -1,6 +1,6 @@
 
 import { createHash } from 'node:crypto';
-import { sql } from '../db/index.js';
+import { supabase } from '../db/index.js';
 
 export interface ApiKey {
   id: string;
@@ -36,20 +36,17 @@ export async function validateApiKey(key: string): Promise<ApiKeyValidation> {
 
   const keyHash = hashApiKey(key);
 
-  const results = await sql<ApiKey[]>`
-    SELECT id, name, key_prefix, permissions, 
-           rate_limit_per_minute, rate_limit_per_day,
-           is_active, expires_at, revoked_at
-    FROM api_keys
-    WHERE key_hash = ${keyHash}
-    LIMIT 1
-  `;
+  const { data, error } = await supabase
+    .from('api_keys')
+    .select('id, name, key_prefix, permissions, rate_limit_per_minute, rate_limit_per_day, is_active, expires_at, revoked_at')
+    .eq('key_hash', keyHash)
+    .single();
 
-  if (results.length === 0) {
+  if (error || !data) {
     return { valid: false, error: 'API key inválida' };
   }
 
-  const apiKey = results[0];
+  const apiKey = data as unknown as ApiKey;
 
   if (!apiKey.is_active) {
     return { valid: false, error: 'API key desactivada' };
@@ -63,11 +60,15 @@ export async function validateApiKey(key: string): Promise<ApiKeyValidation> {
     return { valid: false, error: 'API key expirada' };
   }
 
-  sql`
-    UPDATE api_keys 
-    SET last_used_at = NOW(), request_count = request_count + 1
-    WHERE id = ${apiKey.id}
-  `.catch(() => {});
+  // Update last used info asynchronously
+  supabase
+    .from('api_keys')
+    .update({ 
+      last_used_at: new Date().toISOString(), 
+      request_count: (apiKey.request_count || 0) + 1 
+    })
+    .eq('id', apiKey.id)
+    .then();
 
   return {
     valid: true,
@@ -95,26 +96,29 @@ export async function createApiKey(params: {
   const prefix = key.substring(0, 16);
   const keyHash = hashApiKey(key);
 
-  const result = await sql<{ id: string }[]>`
-    INSERT INTO api_keys (name, key_hash, key_prefix, description, created_by, 
-                          permissions, rate_limit_per_minute, rate_limit_per_day, expires_at)
-    VALUES (
-      ${params.name},
-      ${keyHash},
-      ${prefix},
-      ${params.description || null},
-      ${params.createdBy || null},
-      ${JSON.stringify(params.permissions || ['read', 'write'])}::jsonb,
-      ${params.rateLimitPerMinute || 60},
-      ${params.rateLimitPerDay || 10000},
-      ${params.expiresAt?.toISOString() || null}
-    )
-    RETURNING id
-  `;
+  const { data, error } = await supabase
+    .from('api_keys')
+    .insert({
+      name: params.name,
+      key_hash: keyHash,
+      key_prefix: prefix,
+      description: params.description || null,
+      created_by: params.createdBy || null,
+      permissions: params.permissions || ['read', 'write'],
+      rate_limit_per_minute: params.rateLimitPerMinute || 60,
+      rate_limit_per_day: params.rateLimitPerDay || 10000,
+      expires_at: params.expiresAt?.toISOString() || null
+    })
+    .select('id')
+    .single();
+
+  if (error) {
+    throw new Error(`Error creando API key: ${error.message}`);
+  }
 
   return {
     key, 
-    keyId: result[0].id,
+    keyId: data.id,
     prefix,
   };
 }
