@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+
+# Bun
+bun.lockb
+
+# Documentación privada
+
+# MCP configuration (puede contener credenciales)
+.vscode/mcp.json
+
+# Configuración de desarrollo local (puede contener credenciales)
+/scripts
