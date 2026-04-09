@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { supabase } from '../db/index.js';
 import type { Conversation, ChatLog, ConversationStatus, MessageRole } from '../db/types.js';
 import { resetInactivityWarning } from './inactivity.js';
+import { emit, emitStatusChange } from '../lib/event-bus.js';
 
 export const saveInteractionSchema = z.object({
   sessionId: z.string().min(1),
@@ -129,6 +130,14 @@ export async function saveInteraction(input: SaveInteractionInput): Promise<Chat
   if (role === 'user') {
     await resetInactivityWarning(conversation.id);
   }
+
+  // Emitir evento para tiempo real
+  emit({
+    type: 'new_message',
+    sessionId,
+    data: log as unknown as Record<string, unknown>,
+    timestamp: new Date().toISOString(),
+  });
   
   return log as unknown as ChatLog;
 }
@@ -219,6 +228,10 @@ export async function updateStatus(sessionId: string, status: ConversationStatus
     .single();
   
   if (error) throw error;
+
+  // Emitir evento de cambio de estado
+  emitStatusChange(sessionId, status);
+
   return data as unknown as Conversation;
 }
 
