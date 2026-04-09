@@ -17,7 +17,7 @@ const VERSION = '1.3.0';
 export const adminRouter = new Hono();
 
 adminRouter.get('/health', async (c) => {
-  const dbConnected = await checkDatabaseConnection();
+  const dbStatus = await checkDatabaseConnection();
   const cacheStats = getAllCacheStats();
   const inactivity = getInactivityStats();
   
@@ -25,7 +25,8 @@ adminRouter.get('/health', async (c) => {
     status: 'ok',
     version: VERSION,
     timestamp: new Date().toISOString(),
-    database: dbConnected ? 'connected' : 'disconnected',
+    database: dbStatus.connected ? 'connected' : 'disconnected',
+    database_details: !dbStatus.connected ? dbStatus : undefined,
     activeSessions: getActiveSessionCount(),
     cache: cacheStats,
     inactivity,
