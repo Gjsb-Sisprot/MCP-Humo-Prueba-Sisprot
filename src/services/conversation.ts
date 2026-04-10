@@ -18,6 +18,7 @@ export const saveInteractionSchema = z.object({
   contactName: z.string().optional(),
   contactEmail: z.string().optional(),
   contactPhone: z.string().optional(),
+  silent: z.boolean().optional(),
 });
 
 export const getHistorySchema = z.object({
@@ -81,19 +82,10 @@ export async function getOrCreateConversation(sessionId: string, userId?: string
 }
 
 export async function saveInteraction(input: SaveInteractionInput): Promise<ChatLog> {
-  const {
-    sessionId,
-    userId,
-    role,
-    content,
-    toolName,
-    toolCallId,
-    identification,
-    contract,
-    sector,
-    contactName,
-    contactEmail,
-    contactPhone,
+  const { 
+    sessionId, userId, role, content, toolName, toolCallId, 
+    identification, contract, sector, contactName, contactEmail, contactPhone,
+    silent 
   } = saveInteractionSchema.parse(input);
   
   const conversation = await getOrCreateConversation(sessionId, userId);
@@ -131,13 +123,15 @@ export async function saveInteraction(input: SaveInteractionInput): Promise<Chat
     await resetInactivityWarning(conversation.id);
   }
 
-  // Emitir evento para tiempo real
-  emit({
-    type: 'new_message',
-    sessionId,
-    data: log as unknown as Record<string, unknown>,
-    timestamp: new Date().toISOString(),
-  });
+  // Emitir evento para tiempo real si no es silencioso
+  if (!silent) {
+    emit({
+      type: 'new_message',
+      sessionId,
+      data: log as unknown as Record<string, unknown>,
+      timestamp: new Date().toISOString(),
+    });
+  }
   
   return log as unknown as ChatLog;
 }
